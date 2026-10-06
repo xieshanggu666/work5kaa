@@ -7,7 +7,11 @@
 - 执行发车 / 完成归队 / 闭环释放资源占用
 - 跳过资源协同直接执行（兼容历史四态流转与历史遗留台账）
 - 跨处置单容量与运力统一占用校验
+- 两个处置单并发分配同一避难点：容量校验串行化，不超分
 """
+import threading
+import time
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine
@@ -168,6 +172,61 @@ def test_shelter_capacity_shared_across_orders(factory):
         resources.assign_shelter(db, oid2, {"evacuation_id": eid2, "shelter_id": 2,
                                             "people": 10, "role": "transfer_lead"})
     assert ei.value.status_code == 409
+    db.close()
+
+
+def test_concurrent_assign_same_shelter_no_overcommit(factory, monkeypatch):
+    """两个处置单并发分配同一避难点：容量校验串行化，200 容量不会被记成 300。
+
+    用屏障把两个线程的占用查询对齐到同一时刻，并在「校验后、提交前」
+    留出窗口：无锁时双方都在对方提交前读到旧占用，双双通过检查（超分）。
+    """
+    oid1, _ = _approved_order(factory, "natural")
+    oid2, _ = _approved_order(factory, "rule")
+    eid1 = _evac_id(factory, oid1)
+    eid2 = _evac_id(factory, oid2)
+
+    barrier = threading.Barrier(2)
+    orig_used = resources._shelter_used
+
+    def synced_used(db, exclude_order=None):
+        try:
+            barrier.wait(timeout=2)
+        except threading.BrokenBarrierError:
+            pass  # 持锁线程先到、另一线程在锁外等待：屏障放开后各自继续
+        used = orig_used(db, exclude_order=exclude_order)
+        time.sleep(0.05)  # 放大「校验后、提交前」窗口，稳定复现并发超分
+        return used
+
+    monkeypatch.setattr(resources, "_shelter_used", synced_used)
+
+    results = []
+
+    def assign(oid, eid):
+        db = factory()
+        try:
+            resources.assign_shelter(db, oid, {"evacuation_id": eid, "shelter_id": 2,
+                                               "people": 150, "role": "transfer_lead"})
+            results.append("ok")
+        except HTTPException as e:
+            results.append(e.status_code)
+        finally:
+            db.close()
+
+    threads = [threading.Thread(target=assign, args=(oid, eid))
+               for oid, eid in ((oid1, eid1), (oid2, eid2))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 恰有一单分配成功，另一单因容量不足被拒
+    assert results.count("ok") == 1
+    assert results.count(409) == 1
+    db = factory()
+    shelter2 = [s for s in resources.list_shelters(db) if s["id"] == 2][0]
+    assert shelter2["used"] == 150
+    assert shelter2["available"] == 50
     db.close()
 
 

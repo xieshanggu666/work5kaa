@@ -7,6 +7,8 @@
     指挥员     commander       → 确认资源调度令（approved → resourced）
 
 容量/运力/库存跨处置单统一校验（其它处置单已占份额计入占用），超分返回 409；
+同一避难点的「占用查询 + 容量校验 + 落库」按避难点串行化（_shelter_lock），
+避免两个处置单并发分配同一避难点时双双通过容量检查造成超分；
 指挥员确认调度令时实际扣减物资库存，并把避难点分配回写转移进度
 (evacuation_records.shelter_id/shelter_name)，同时风险预警进入「处置中」。
 跳过资源协同直接启动执行也允许（兼容既有四态流转与历史处置记录）；
@@ -17,7 +19,9 @@
 """
 from __future__ import annotations
 
+import threading
 from datetime import datetime
+from typing import Dict
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -34,6 +38,17 @@ ROLE_TEXT = {"dispatcher": "调度员", "duty": "预警值守",
 VEHICLE_KIND_TEXT = {"bus": "大巴", "truck": "货车", "ambulance": "救护车"}
 VEHICLE_STATUS_TEXT = {"standby": "待命", "dispatched": "已派出",
                        "departed": "执行中", "returned": "已归队"}
+
+# 避难点维度串行锁：容量「校验 + 落库」整体原子化。
+# 否则两个处置单并发分配同一避难点时，都在对方提交前读到旧占用，
+# 双双通过容量检查（如 200 人容量被记成 300 人）。
+_shelter_locks_guard = threading.Lock()
+_shelter_locks: Dict[int, threading.Lock] = {}
+
+
+def _shelter_lock(shelter_id: int) -> threading.Lock:
+    with _shelter_locks_guard:
+        return _shelter_locks.setdefault(shelter_id, threading.Lock())
 
 
 # ---------------- 基础资源台账（带实时可用量） ----------------
@@ -274,41 +289,48 @@ def assign_shelter(db: Session, order_id: int, body: dict) -> dict:
     if body.get("role") != "transfer_lead":
         raise HTTPException(403, f"避难点容量由转移负责人分配（当前角色："
                                 f"{ROLE_TEXT.get(body.get('role'), body.get('role'))}）")
-    order = _get_order_resources_ready(db, order_id)
-    evac = _get_evac(db, order, int(body.get("evacuation_id") or 0))
-    shelter = db.get(Shelter, int(body.get("shelter_id") or 0))
-    if shelter is None or not shelter.active:
-        raise HTTPException(404, "避难点不存在或已停用")
     people = int(body.get("people") or 0)
     if people <= 0:
         raise HTTPException(422, "安置人数须大于 0")
+    shelter_id = int(body.get("shelter_id") or 0)
+    evac_id = int(body.get("evacuation_id") or 0)
 
-    # 同点同区重复分配：幂等归并为更新（便于调整人数）。
-    # 先查询再构造新对象，避免未 flush 的 pending 对象进入容量统计查询。
-    rec = (db.query(ShelterAssignment)
-           .filter(ShelterAssignment.disposal_id == order.id,
-                   ShelterAssignment.evacuation_id == evac.id,
-                   ShelterAssignment.shelter_id == shelter.id).first())
-    other_used = _shelter_used(db, exclude_order=order.id)
-    # 本单在该避难点的占用：同点其它记录之和（更新时当前记录按新值替换）
-    own_rows = db.query(ShelterAssignment).filter(
-        ShelterAssignment.disposal_id == order.id,
-        ShelterAssignment.shelter_id == shelter.id).all()
-    own_used = sum(r.people or 0 for r in own_rows if rec is None or r.id != rec.id)
-    if other_used.get(shelter.id, 0) + own_used + people > shelter.capacity:
-        raise HTTPException(
-            409, f"避难点「{shelter.name}」容量不足：总容量 {shelter.capacity} 人，"
-                 f"其它处置单占用 {other_used.get(shelter.id, 0)} 人，本单已分 {own_used} 人，"
-                 f"本次再分 {people} 人将超分")
+    # 容量「查占用 + 校验 + 落库」整个临界区按避难点串行化：
+    # 锁前不做任何数据库读，保证锁内查询看到的是最新已提交占用，
+    # 并发分配同一避难点的另一处置单必须等本单提交后再校验。
+    with _shelter_lock(shelter_id):
+        order = _get_order_resources_ready(db, order_id)
+        evac = _get_evac(db, order, evac_id)
+        shelter = db.get(Shelter, shelter_id)
+        if shelter is None or not shelter.active:
+            raise HTTPException(404, "避难点不存在或已停用")
 
-    if rec is None:
-        rec = ShelterAssignment(disposal_id=order.id, evacuation_id=evac.id,
-                                shelter_id=shelter.id)
-        db.add(rec)
-    rec.people = people
-    rec.note = (body.get("note") or "").strip()
-    rec.created_by = (body.get("operator") or "").strip() or "转移负责人"
-    db.commit()
+        # 同点同区重复分配：幂等归并为更新（便于调整人数）。
+        # 先查询再构造新对象，避免未 flush 的 pending 对象进入容量统计查询。
+        rec = (db.query(ShelterAssignment)
+               .filter(ShelterAssignment.disposal_id == order.id,
+                       ShelterAssignment.evacuation_id == evac.id,
+                       ShelterAssignment.shelter_id == shelter.id).first())
+        other_used = _shelter_used(db, exclude_order=order.id)
+        # 本单在该避难点的占用：同点其它记录之和（更新时当前记录按新值替换）
+        own_rows = db.query(ShelterAssignment).filter(
+            ShelterAssignment.disposal_id == order.id,
+            ShelterAssignment.shelter_id == shelter.id).all()
+        own_used = sum(r.people or 0 for r in own_rows if rec is None or r.id != rec.id)
+        if other_used.get(shelter.id, 0) + own_used + people > shelter.capacity:
+            raise HTTPException(
+                409, f"避难点「{shelter.name}」容量不足：总容量 {shelter.capacity} 人，"
+                     f"其它处置单占用 {other_used.get(shelter.id, 0)} 人，本单已分 {own_used} 人，"
+                     f"本次再分 {people} 人将超分")
+
+        if rec is None:
+            rec = ShelterAssignment(disposal_id=order.id, evacuation_id=evac.id,
+                                    shelter_id=shelter.id)
+            db.add(rec)
+        rec.people = people
+        rec.note = (body.get("note") or "").strip()
+        rec.created_by = (body.get("operator") or "").strip() or "转移负责人"
+        db.commit()
     return get_order_resources(db, order)
 
 

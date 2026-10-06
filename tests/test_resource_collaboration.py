@@ -7,7 +7,11 @@
 - 执行发车 / 完成归队 / 闭环释放资源占用
 - 跳过资源协同直接执行（兼容历史四态流转与历史遗留台账）
 - 跨处置单容量与运力统一占用校验
+- 并发处置单同时抢占同一避难点/车辆/物资：占用检查与写入串行化，
+  杜绝两个请求同时通过检查导致超分（200 人容量被记成 300 人）
 """
+import threading
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine
@@ -15,7 +19,8 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.database import Base
 from app.models import (DisposalOrder, EvacuationRecord, FloodZone, RainfallEvent,
-                        Reservoir, Shelter, Supply, Vehicle, WarningRecord)
+                        Reservoir, Shelter, ShelterAssignment, Supply,
+                        SupplyAllocation, Vehicle, VehicleDispatch, WarningRecord)
 from app.services import disposal, resources
 from app.services.forecast import run_forecast
 
@@ -385,4 +390,159 @@ def test_warning_handling_not_reset_by_forecast_rerun(factory):
     e = db.query(EvacuationRecord).filter(EvacuationRecord.run_id == rid).one()
     assert w.status == "handling" and w.disposal_id == oid
     assert e.shelter_id == 1 and e.shelter_name == "一中避难点"
+    db.close()
+
+
+# ---------------- 并发：跨处置单资源抢占串行化 ----------------
+def _two_orders(factory):
+    """两个不同预报运行的已审核处置单及其转移台账。"""
+    oid1, _ = _approved_order(factory, "natural")
+    oid2, _ = _approved_order(factory, "rule")
+    return oid1, _evac_id(factory, oid1), oid2, _evac_id(factory, oid2)
+
+
+def _concurrent(factory, target, pairs):
+    """屏障同时释放多个线程并发执行同一类资源操作，返回 {tag: 结果/异常}。"""
+    barrier = threading.Barrier(len(pairs))
+    outcomes = {}
+
+    def runner(tag, args):
+        db = factory()
+        try:
+            barrier.wait()
+            outcomes[tag] = target(db, *args)
+        except Exception as exc:  # noqa: BLE001 - 并发下预期出现 409
+            outcomes[tag] = exc
+        finally:
+            db.close()
+
+    threads = [threading.Thread(target=runner, args=(tag, args))
+               for tag, args in pairs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return outcomes
+
+
+def test_concurrent_shelter_assignment_no_over_capacity(factory):
+    """两个处置单并发分配同一避难点：至多一个成功，总占用不得超过容量。
+
+    避难点容量 200，两单各分 150；并发下若都通过容量检查将记成 300。
+    """
+    oid1, eid1, oid2, eid2 = _two_orders(factory)
+    outcomes = _concurrent(
+        factory, resources.assign_shelter,
+        [("A", (oid1, {"evacuation_id": eid1, "shelter_id": 2, "people": 150,
+                       "role": "transfer_lead"})),
+         ("B", (oid2, {"evacuation_id": eid2, "shelter_id": 2, "people": 150,
+                       "role": "transfer_lead"}))])
+
+    statuses = {tag: (exc.status_code if isinstance(exc, HTTPException) else "ok")
+                for tag, exc in outcomes.items()}
+    rejected = [tag for tag, code in statuses.items() if code == 409]
+    assert rejected, f"并发超分应至少一单被 409 拒绝：{statuses}"
+    db = factory()
+    total = sum(r.people or 0
+                for r in db.query(ShelterAssignment).filter_by(shelter_id=2))
+    assert total <= 200
+    db.close()
+
+
+def test_concurrent_shelter_assignment_interleaved_window(factory):
+    """精确交错：A 通过容量检查后、提交前暂停，B 在该窗口完成检查，A 再提交。
+
+    直接命中「检查—提交」之间的竞态窗口（200 容量被记成 300 的成因）。
+    """
+    oid1, eid1, oid2, eid2 = _two_orders(factory)
+    in_position = threading.Event()
+    release_a = threading.Event()
+    outcomes = {}
+
+    def worker_a():
+        db = factory()
+        real_commit = db.commit
+
+        def slow_commit():
+            in_position.set()
+            release_a.wait(5)
+            return real_commit()
+
+        db.commit = slow_commit
+        try:
+            resources.assign_shelter(db, oid1, {"evacuation_id": eid1,
+                                                "shelter_id": 2, "people": 150,
+                                                "role": "transfer_lead"})
+        except Exception as exc:  # noqa: BLE001
+            outcomes["A"] = exc
+        finally:
+            db.close()
+
+    def worker_b():
+        db = factory()
+        try:
+            in_position.wait(5)
+            resources.assign_shelter(db, oid2, {"evacuation_id": eid2,
+                                                "shelter_id": 2, "people": 150,
+                                                "role": "transfer_lead"})
+        except Exception as exc:  # noqa: BLE001
+            outcomes["B"] = exc
+        finally:
+            db.close()
+
+    ta = threading.Thread(target=worker_a)
+    tb = threading.Thread(target=worker_b)
+    ta.start(); tb.start()
+    tb.join(); release_a.set(); ta.join()
+
+    # 串行化后后到的一单必须被容量校验拒绝
+    assert any(isinstance(exc, HTTPException) and exc.status_code == 409
+               for exc in outcomes.values()), outcomes
+    db = factory()
+    total = sum(r.people or 0
+                for r in db.query(ShelterAssignment).filter_by(shelter_id=2))
+    assert total == 150
+    db.close()
+
+
+def test_concurrent_vehicle_dispatch_exclusive(factory):
+    """两个处置单并发派同一辆车：跨单互斥校验串行化，至多一单成功。"""
+    oid1, eid1, oid2, eid2 = _two_orders(factory)
+    outcomes = _concurrent(
+        factory, resources.assign_vehicle,
+        [("A", (oid1, {"vehicle_id": 1, "evacuation_id": eid1,
+                       "role": "supply_manager"})),
+         ("B", (oid2, {"vehicle_id": 1, "evacuation_id": eid2,
+                       "role": "supply_manager"}))])
+
+    statuses = {tag: (exc.status_code if isinstance(exc, HTTPException) else "ok")
+                for tag, exc in outcomes.items()}
+    rejected = [tag for tag, code in statuses.items() if code == 409]
+    assert rejected, f"同一车辆并发派车应至少一单被 409 拒绝：{statuses}"
+    db = factory()
+    owners = {r.disposal_id for r in db.query(VehicleDispatch).filter_by(vehicle_id=1)}
+    assert len(owners) == 1
+    db.close()
+
+
+def test_concurrent_supply_assignment_no_over_stock(factory):
+    """两个处置单并发分配同一物资：库存预占检查串行化，合计不得超过库存 100。"""
+    oid1, eid1, oid2, eid2 = _two_orders(factory)
+    outcomes = _concurrent(
+        factory, resources.assign_supply,
+        [("A", (oid1, {"supply_id": 1, "quantity": 80, "evacuation_id": eid1,
+                       "role": "supply_manager"})),
+         ("B", (oid2, {"supply_id": 1, "quantity": 80, "evacuation_id": eid2,
+                       "role": "supply_manager"}))])
+
+    statuses = {tag: (exc.status_code if isinstance(exc, HTTPException) else "ok")
+                for tag, exc in outcomes.items()}
+    rejected = [tag for tag, code in statuses.items() if code == 409]
+    assert rejected, f"并发超分库存应至少一单被 409 拒绝：{statuses}"
+    db = factory()
+    pending = (db.query(SupplyAllocation.quantity)
+               .join(DisposalOrder, DisposalOrder.id == SupplyAllocation.disposal_id)
+               .filter(SupplyAllocation.supply_id == 1,
+                       DisposalOrder.status == "approved").all())
+    assert sum(r[0] for r in pending) <= 100
     db.close()
